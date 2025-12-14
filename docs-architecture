@@ -1,0 +1,114 @@
+# Architecture & Design Notes — Sheets → Calendar Sync
+
+## Goal
+Use a Google Sheet as the single source of truth to manage Google Calendar events:
+- Create events from rows
+- Update events when rows change
+- Delete events when marked cancelled
+- Provide clear feedback to the user in the sheet
+
+This system was designed for Special Education IEP scheduling but is generalizable.
+
+---
+
+## Data Model (Sheet as Source of Truth)
+
+### Why a sheet?
+A spreadsheet is accessible to non-technical users and already fits scheduling workflows.
+
+### Key columns
+- **Event ID (P):** stores the Google Calendar event identifier for idempotent updates.
+- **Status (Q):** operational control. `CANCELLED` triggers event deletion.
+- **Error (R):** user-visible validation and runtime errors.
+- **Sync Key (U):** detects whether the row changed since last successful sync.
+- **Last Synced (V):** observability; includes date + time of last success.
+
+Columns like **IEP DUE DATE** and **ATTEMPTED CONTACT** are intentionally kept in the sheet and ignored for calendar output.
+
+---
+
+## Idempotency: Why Event ID matters
+Calendar integrations frequently create duplicates if they “blindly create events” each run.
+
+This project solves that by:
+1. Creating the event once
+2. Writing the event’s ID back to the sheet
+3. Updating the event in-place on future runs using that stored ID
+
+Result:
+- Stable event identity
+- No duplicate invites for repeated script runs
+
+---
+
+## Change Detection: Sync Key
+Calling the Calendar API repeatedly can trigger rate limits.
+
+To minimize unnecessary writes, each row generates a **Sync Key**:
+- It is a deterministic string derived from all calendar-relevant fields (title inputs, participants, location, start/end times, front office, status).
+- If the current Sync Key matches the stored Sync Key AND Event ID exists, the script **skips** any calendar update.
+
+This significantly reduces Calendar API usage and improves reliability at scale.
+
+---
+
+## Cancellation Behavior (Status = CANCELLED)
+When `Status` is set to CANCELLED:
+- The script attempts to delete the calendar event using Event ID
+- Clears Event ID / Sync Key / Last Synced to prevent future updates
+- Leaves the row data in the sheet as historical record
+
+This supports real workflows: keep evidence of the meeting record while removing the invite.
+
+---
+
+## Validation & Error Reporting
+Rows can fail for common reasons:
+- Missing student name
+- Missing/invalid Start Date
+- Bad time formats
+
+The script:
+- Validates before any calendar calls
+- Writes a human-readable message to the **Error** column
+- Highlights the error cell visually
+
+This makes troubleshooting accessible to non-technical users.
+
+---
+
+## Duplicate Prevention (Per run)
+Even with Event IDs, users can accidentally duplicate rows (copy/paste).
+To prevent creating 2 events in one run with identical keys, the script uses:
+- `student + meeting type + start timestamp` as a per-run duplicate key.
+
+If a duplicate row is detected in the same sync run, the second one is rejected with an error message.
+
+---
+
+## Rate Limits & Operational Guidance
+Google Calendar enforces rate limits on create/update/delete operations.
+
+Operational practices built into the design:
+- Use a **15-minute time-driven trigger** (recommended)
+- Change detection avoids repeated updates
+- Manual “bulk creation” should be done sparingly to avoid temporary blocks
+
+---
+
+## Extensibility
+This design can easily support:
+- Multiple tabs (one per case manager)
+- Multiple calendars (routing rows to calendars)
+- Email notifications on cancellations/reschedules
+- Color-coding events by meeting type (requires Advanced Calendar API)
+
+---
+
+## Summary
+This project demonstrates production-minded automation principles:
+- Source of truth
+- Idempotent operations
+- Change detection
+- Validation & observability
+- Rate-limit-aware design
