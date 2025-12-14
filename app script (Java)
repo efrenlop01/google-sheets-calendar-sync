@@ -1,0 +1,397 @@
+/**
+ * Google Sheets → Google Calendar Sync (Apps Script)
+ *
+ * Purpose:
+ * - Use a Google Sheet tab as the "source of truth" to create/update/delete Google Calendar events.
+ * - Idempotent updates using stored Event IDs (prevents duplicates).
+ * - Change detection using Sync Key (minimizes Calendar API calls / reduces rate-limit risk).
+ * - Validation + row-level error reporting in-sheet.
+ *
+ * Expected Sheet Columns (by header order):
+ * A  Title
+ * B  Students Name
+ * C  Case Manager
+ * D  Type of Meeting
+ * E  Language - Interpreter
+ * F  Start Date
+ * G  Start Time
+ * H  End Time
+ * I  Location
+ * J  Counselor
+ * K  General ED
+ * L  Admin
+ * M  Language - Interpreter Name
+ * N  Psychologist
+ * O  Front Office
+ * P  Event ID          (script writes)
+ * Q  Status            (CANCELLED deletes)
+ * R  Error             (script writes)
+ * S  IEP DUE DATE      (ignored by calendar)
+ * T  ATTEMPTED CONTACT (ignored by calendar)
+ * U  SYNC KEY          (script writes)
+ * V  LAST SYNCED       (script writes, includes time)
+ */
+
+// ===================== CONFIG =====================
+const CONFIG = {
+  calendarId: 'REPLACE_WITH_YOUR_CALENDAR_ID',
+  sheetName: 'chen train',
+  // Recommended: every 15 minutes (time-driven trigger).
+  lastSyncedFormat: 'MM/dd/yyyy HH:mm:ss',
+  defaultDurationMinutes: 60,
+};
+
+// ===================== COLUMN MAP =====================
+// 0-based indexes (A=0, B=1, ...)
+const COL = {
+  TITLE: 0,            // A
+  STUDENT: 1,          // B
+  CASE_MANAGER: 2,     // C
+  MEETING_TYPE: 3,     // D
+  LANGUAGE: 4,         // E
+  START_DATE: 5,       // F
+  START_TIME: 6,       // G
+  END_TIME: 7,         // H
+  LOCATION: 8,         // I
+  COUNSELOR: 9,        // J
+  GENERAL_ED: 10,      // K
+  ADMIN: 11,           // L
+  LANG_INT_NAME: 12,   // M
+  PSYCHOLOGIST: 13,    // N
+  FRONT_OFFICE: 14,    // O
+  EVENT_ID: 15,        // P
+  STATUS: 16,          // Q
+  ERROR: 17,           // R
+  // S=18 (ignored)
+  // T=19 (ignored)
+  SYNC_KEY: 20,        // U
+  LAST_SYNCED: 21,     // V
+};
+
+// Read columns A–V (A..V = 22 columns)
+const READ_COL_COUNT = 22;
+
+// ===================== ENTRYPOINT =====================
+function syncChenToCalendar() {
+  const { sheet, values, lastRow } = loadSheetData_();
+
+  const calendar = CalendarApp.getCalendarById(CONFIG.calendarId);
+  if (!calendar) {
+    throw new Error(`Calendar not found. Check CONFIG.calendarId.`);
+  }
+
+  // Ranges we write back
+  const eventIdRange = sheet.getRange(2, COL.EVENT_ID + 1, lastRow - 1, 1);
+  const statusRange  = sheet.getRange(2, COL.STATUS + 1,  lastRow - 1, 1);
+  const errorRange   = sheet.getRange(2, COL.ERROR + 1,   lastRow - 1, 1);
+  const syncKeyRange = sheet.getRange(2, COL.SYNC_KEY + 1, lastRow - 1, 1);
+  const lastSyncedRange = sheet.getRange(2, COL.LAST_SYNCED + 1, lastRow - 1, 1);
+
+  const eventIdValues = eventIdRange.getValues();
+  const statusValues  = statusRange.getValues();
+  const errorValues   = errorRange.getValues();
+  const syncKeyValues = syncKeyRange.getValues();
+  const lastSyncedValues = lastSyncedRange.getValues();
+
+  // Clear previous errors
+  for (let i = 0; i < errorValues.length; i++) errorValues[i][0] = '';
+  errorRange.setValues(errorValues);
+  errorRange.setBackground(null);
+
+  // Duplicate prevention per run: same student + meeting type + start
+  const seenDupKeys = Object.create(null);
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const rowNumber = i + 2;
+
+    const status = normalizeStatus_(row[COL.STATUS]);
+    const existingEventId = (eventIdValues[i][0] || '').toString().trim();
+    const storedSyncKey = (syncKeyValues[i][0] || '').toString();
+
+    // If cancelled: delete event and clear tracking
+    if (status === 'CANCELLED') {
+      const cancelErrors = handleCancelledRow_(calendar, existingEventId);
+      if (cancelErrors.length) {
+        errorValues[i][0] = cancelErrors.join('; ');
+      }
+      eventIdValues[i][0] = '';
+      syncKeyValues[i][0] = '';
+      lastSyncedValues[i][0] = '';
+      continue;
+    }
+
+    // Validate row (no calendar calls if invalid)
+    const validation = validateRow_(row);
+    if (!validation.ok) {
+      errorValues[i][0] = validation.errors.join('; ');
+      continue;
+    }
+
+    // Build start/end
+    const start = combineDateTime_(row[COL.START_DATE], row[COL.START_TIME]);
+    let end = combineDateTime_(row[COL.START_DATE], row[COL.END_TIME]);
+    if (!start) {
+      errorValues[i][0] = 'Cannot parse start time';
+      continue;
+    }
+    if (!end) end = addMinutes_(start, CONFIG.defaultDurationMinutes);
+
+    // Per-run duplicate key
+    const dupKey = buildDupKey_(row, start);
+    if (seenDupKeys[dupKey]) {
+      errorValues[i][0] = 'Duplicate row: same student, meeting type, date & time';
+      continue;
+    }
+    seenDupKeys[dupKey] = true;
+
+    // Auto-title if missing
+    const title = ensureTitle_(sheet, row, rowNumber);
+
+    // Build payload
+    const payload = {
+      title,
+      start,
+      end,
+      location: (row[COL.LOCATION] || '').toString().trim(),
+      description: buildDescription_(row),
+    };
+
+    // Change detection key
+    const currentSyncKey = buildSyncKey_(row, start, end);
+
+    // If unchanged and we already have an event id → skip calendar calls
+    if (existingEventId && storedSyncKey === currentSyncKey) {
+      continue;
+    }
+
+    // Create or update event
+    try {
+      const newEventId = upsertEvent_(calendar, existingEventId, payload);
+      eventIdValues[i][0] = newEventId;
+      syncKeyValues[i][0] = currentSyncKey;
+      lastSyncedValues[i][0] = Utilities.formatDate(
+        new Date(),
+        Session.getScriptTimeZone(),
+        CONFIG.lastSyncedFormat
+      );
+    } catch (e) {
+      errorValues[i][0] = `Error creating/updating event: ${e}`;
+    }
+  }
+
+  // Write back changes
+  eventIdRange.setValues(eventIdValues);
+  errorRange.setValues(errorValues);
+  syncKeyRange.setValues(syncKeyValues);
+  lastSyncedRange.setValues(lastSyncedValues);
+
+  // Highlight errors
+  highlightErrors_(errorRange, errorValues);
+}
+
+// ===================== DATA LOADING =====================
+function loadSheetData_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CONFIG.sheetName);
+  if (!sheet) throw new Error(`Sheet "${CONFIG.sheetName}" not found.`);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { sheet, values: [], lastRow };
+
+  const range = sheet.getRange(2, 1, lastRow - 1, READ_COL_COUNT);
+  const values = range.getValues();
+  return { sheet, values, lastRow };
+}
+
+// ===================== ROW HELPERS =====================
+function normalizeStatus_(value) {
+  const s = (value || '').toString().trim().toUpperCase();
+  if (s === 'CANCELED') return 'CANCELLED';
+  return s;
+}
+
+function validateRow_(row) {
+  const errors = [];
+
+  const student = (row[COL.STUDENT] || '').toString().trim();
+  if (!student) errors.push('Missing student name');
+
+  const startDate = row[COL.START_DATE];
+  if (!(startDate instanceof Date)) errors.push('Missing or invalid start date');
+
+  const startTime = row[COL.START_TIME];
+  const endTime = row[COL.END_TIME];
+  if (!isValidTimeCell_(startTime)) errors.push('Invalid start time');
+  if (endTime && !isValidTimeCell_(endTime)) errors.push('Invalid end time');
+
+  return { ok: errors.length === 0, errors };
+}
+
+function isValidTimeCell_(timeCell) {
+  if (!timeCell) return true;
+  if (timeCell instanceof Date) return true;
+  if (typeof timeCell === 'string') {
+    const t = timeCell.trim();
+    if (!t || t.toUpperCase() === 'TBD') return true;
+    return !!parseTimeString_(t);
+  }
+  return false;
+}
+
+function ensureTitle_(sheet, row, rowNumber) {
+  let title = (row[COL.TITLE] || '').toString().trim();
+  if (title) return title;
+
+  const meetingType = (row[COL.MEETING_TYPE] || '').toString().trim() || 'IEP';
+  const student = (row[COL.STUDENT] || '').toString().trim() || 'Student';
+  title = `${meetingType} – ${student}`;
+
+  // Write back to sheet so the title is stable
+  sheet.getRange(rowNumber, COL.TITLE + 1).setValue(title);
+  return title;
+}
+
+function buildDescription_(row) {
+  const lines = [
+    ['Student', row[COL.STUDENT]],
+    ['Case Manager', row[COL.CASE_MANAGER]],
+    ['Type of Meeting', row[COL.MEETING_TYPE]],
+    ['Language / Interpreter', row[COL.LANGUAGE]],
+    ['Counselor', row[COL.COUNSELOR]],
+    ['General ED', row[COL.GENERAL_ED]],
+    ['Admin', row[COL.ADMIN]],
+    ['Interpreter Name', row[COL.LANG_INT_NAME]],
+    ['Psychologist', row[COL.PSYCHOLOGIST]],
+    ['Front Office', row[COL.FRONT_OFFICE]],
+  ].map(([k, v]) => `${k}: ${(v || '').toString().trim()}`)
+   .filter(line => !line.endsWith(':'));
+
+  return lines.join('\n');
+}
+
+function buildSyncKey_(row, start, end) {
+  return [
+    (row[COL.STUDENT] || '').toString().trim(),
+    (row[COL.CASE_MANAGER] || '').toString().trim(),
+    (row[COL.MEETING_TYPE] || '').toString().trim(),
+    (row[COL.LANGUAGE] || '').toString().trim(),
+    (row[COL.LOCATION] || '').toString().trim(),
+    (row[COL.COUNSELOR] || '').toString().trim(),
+    (row[COL.GENERAL_ED] || '').toString().trim(),
+    (row[COL.ADMIN] || '').toString().trim(),
+    (row[COL.LANG_INT_NAME] || '').toString().trim(),
+    (row[COL.PSYCHOLOGIST] || '').toString().trim(),
+    (row[COL.FRONT_OFFICE] || '').toString().trim(),
+    start.toISOString(),
+    end.toISOString(),
+    normalizeStatus_(row[COL.STATUS]),
+  ].join('|');
+}
+
+function buildDupKey_(row, start) {
+  const student = (row[COL.STUDENT] || '').toString().trim();
+  const type = (row[COL.MEETING_TYPE] || '').toString().trim();
+  return `${student}|${type}|${start.toISOString()}`;
+}
+
+// ===================== CALENDAR OPERATIONS =====================
+function upsertEvent_(calendar, eventId, payload) {
+  if (eventId) {
+    const existing = safeGetEventById_(calendar, eventId);
+    if (existing) {
+      existing.setTitle(payload.title);
+      existing.setTime(payload.start, payload.end);
+      existing.setLocation(payload.location);
+      existing.setDescription(payload.description);
+      return eventId;
+    }
+    // Event ID existed in sheet, but event was deleted manually → recreate
+  }
+
+  const created = calendar.createEvent(payload.title, payload.start, payload.end, {
+    location: payload.location,
+    description: payload.description,
+  });
+  return created.getId();
+}
+
+function handleCancelledRow_(calendar, eventId) {
+  const errors = [];
+  if (!eventId) return errors;
+
+  try {
+    const ev = safeGetEventById_(calendar, eventId);
+    if (ev) ev.deleteEvent();
+  } catch (e) {
+    errors.push(`Could not delete event: ${e}`);
+  }
+  return errors;
+}
+
+function safeGetEventById_(calendar, eventId) {
+  try {
+    return calendar.getEventById(eventId);
+  } catch (_) {
+    return null;
+  }
+}
+
+// ===================== DATE/TIME UTILS =====================
+function combineDateTime_(dateCell, timeCell) {
+  if (!(dateCell instanceof Date)) return null;
+
+  const result = new Date(dateCell);
+  if (timeCell instanceof Date) {
+    result.setHours(timeCell.getHours(), timeCell.getMinutes(), 0, 0);
+    return result;
+  }
+
+  if (typeof timeCell === 'string') {
+    const t = timeCell.trim();
+    if (!t || t.toUpperCase() === 'TBD') return null;
+    const parsed = parseTimeString_(t);
+    if (!parsed) return null;
+    result.setHours(parsed.hours, parsed.minutes, 0, 0);
+    return result;
+  }
+
+  return null;
+}
+
+function parseTimeString_(str) {
+  // "h:mm AM/PM"
+  let m = str.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (m) {
+    let hours = parseInt(m[1], 10);
+    const minutes = parseInt(m[2], 10);
+    const ampm = m[3].toUpperCase();
+    if (ampm === 'PM' && hours < 12) hours += 12;
+    if (ampm === 'AM' && hours === 12) hours = 0;
+    return { hours, minutes };
+  }
+
+  // "HH:MM" (24h)
+  m = str.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const hours = parseInt(m[1], 10);
+    const minutes = parseInt(m[2], 10);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+    return { hours, minutes };
+  }
+
+  return null;
+}
+
+function addMinutes_(date, minutes) {
+  return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+// ===================== UI/FORMATTING =====================
+function highlightErrors_(errorRange, errorValues) {
+  const bg = errorRange.getBackgrounds();
+  for (let i = 0; i < errorValues.length; i++) {
+    bg[i][0] = errorValues[i][0] ? '#ffcccc' : null;
+  }
+  errorRange.setBackgrounds(bg);
+}
